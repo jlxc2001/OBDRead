@@ -324,20 +324,7 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 if (hasBtConnectPermission()) bluetoothAdapter.cancelDiscovery();
-                BluetoothSocket s;
-                try {
-                    s = selectedDevice.createRfcommSocketToServiceRecord(SPP_UUID);
-                    s.connect();
-                } catch (Exception first) {
-                    appendLog("标准 SPP 连接失败，尝试备用通道 1：" + first.getMessage() + "\n");
-                    try {
-                        Method m = selectedDevice.getClass().getMethod("createRfcommSocket", int.class);
-                        s = (BluetoothSocket) m.invoke(selectedDevice, 1);
-                        s.connect();
-                    } catch (Exception second) {
-                        throw new IOException("备用连接也失败：" + second.getMessage(), second);
-                    }
-                }
+                BluetoothSocket s = connectBluetoothSocketRobust(selectedDevice);
 
                 synchronized (ioLock) {
                     socket = s;
@@ -360,6 +347,129 @@ public class MainActivity extends Activity {
                 disconnect();
             }
         }, "obd-connect").start();
+    }
+
+
+    private BluetoothSocket connectBluetoothSocketRobust(BluetoothDevice device) throws IOException {
+        // 很多廉价 ELM327 / OBDII 模块可以配对，但不接受“安全 RFCOMM”连接。
+        // Torque 这类老牌软件会优先/同时尝试 insecure RFCOMM，所以这里也按同样思路做多策略重试。
+        IOException lastError = null;
+
+        logDeviceUuids(device);
+
+        // 1. 先尝试 Insecure SPP。很多 OBDII / 1234 模块需要这个。
+        try {
+            return tryConnectSocket("Insecure SPP UUID", createInsecureSocket(device));
+        } catch (Exception e) {
+            lastError = asIoException(e);
+            appendLog("Insecure SPP UUID 失败：" + shortErr(e) + "\n");
+        }
+
+        // 2. 再尝试标准 Secure SPP。
+        try {
+            return tryConnectSocket("Secure SPP UUID", device.createRfcommSocketToServiceRecord(SPP_UUID));
+        } catch (Exception e) {
+            lastError = asIoException(e);
+            appendLog("Secure SPP UUID 失败：" + shortErr(e) + "\n");
+        }
+
+        // 3. 部分克隆模块 SDP 不稳定，但 RFCOMM channel=1 可连。
+        // 先试 insecure channel 1，再试 secure channel 1。
+        try {
+            return tryConnectSocket("Insecure channel 1", createInsecureChannelSocket(device, 1));
+        } catch (Exception e) {
+            lastError = asIoException(e);
+            appendLog("Insecure channel 1 失败：" + shortErr(e) + "\n");
+        }
+        try {
+            return tryConnectSocket("Secure channel 1", createSecureChannelSocket(device, 1));
+        } catch (Exception e) {
+            lastError = asIoException(e);
+            appendLog("Secure channel 1 失败：" + shortErr(e) + "\n");
+        }
+
+        // 4. 兜底：扫描常见 RFCOMM channel。便宜模块偶尔不是 1。
+        for (int ch = 2; ch <= 30; ch++) {
+            try {
+                return tryConnectSocket("Insecure channel " + ch, createInsecureChannelSocket(device, ch));
+            } catch (Exception e) {
+                lastError = asIoException(e);
+                appendLog("ch" + ch + " 失败：" + shortErr(e) + "\n");
+            }
+        }
+
+        throw new IOException("所有蓝牙连接策略都失败。请确认其它 OBD 软件已经完全退出、模块仍插在车上并已上电。最后错误：" + (lastError == null ? "unknown" : lastError.getMessage()), lastError);
+    }
+
+    private void logDeviceUuids(BluetoothDevice device) {
+        try {
+            if (!hasBtConnectPermission()) return;
+            android.os.ParcelUuid[] uuids = device.getUuids();
+            if (uuids == null || uuids.length == 0) {
+                appendLog("设备 SDP UUID：无/未返回。继续尝试标准 SPP。\n");
+                return;
+            }
+            StringBuilder sb = new StringBuilder("设备 SDP UUID：");
+            for (android.os.ParcelUuid u : uuids) sb.append(u.getUuid()).append(' ');
+            sb.append('\n');
+            appendLog(sb.toString());
+        } catch (Exception e) {
+            appendLog("读取设备 UUID 失败：" + shortErr(e) + "\n");
+        }
+    }
+
+    private BluetoothSocket createInsecureSocket(BluetoothDevice device) throws IOException {
+        if (Build.VERSION.SDK_INT >= 10) return device.createInsecureRfcommSocketToServiceRecord(SPP_UUID);
+        return device.createRfcommSocketToServiceRecord(SPP_UUID);
+    }
+
+    private BluetoothSocket createSecureChannelSocket(BluetoothDevice device, int channel) throws Exception {
+        Method m = device.getClass().getMethod("createRfcommSocket", int.class);
+        return (BluetoothSocket) m.invoke(device, channel);
+    }
+
+    private BluetoothSocket createInsecureChannelSocket(BluetoothDevice device, int channel) throws Exception {
+        try {
+            Method m = device.getClass().getMethod("createInsecureRfcommSocket", int.class);
+            return (BluetoothSocket) m.invoke(device, channel);
+        } catch (NoSuchMethodException e) {
+            return createSecureChannelSocket(device, channel);
+        }
+    }
+
+    private BluetoothSocket tryConnectSocket(String label, BluetoothSocket candidate) throws IOException {
+        if (candidate == null) throw new IOException("socket is null");
+        try {
+            if (hasBtConnectPermission()) bluetoothAdapter.cancelDiscovery();
+        } catch (Exception ignored) {}
+        appendLog("尝试连接方式：" + label + "\n");
+        try {
+            candidate.connect();
+            appendLog("连接方式成功：" + label + "\n");
+            return candidate;
+        } catch (IOException e) {
+            try { candidate.close(); } catch (Exception ignored) {}
+            sleep(250);
+            throw e;
+        } catch (RuntimeException e) {
+            try { candidate.close(); } catch (Exception ignored) {}
+            sleep(250);
+            throw e;
+        }
+    }
+
+    private IOException asIoException(Exception e) {
+        if (e instanceof IOException) return (IOException) e;
+        Throwable cause = e.getCause();
+        if (cause instanceof IOException) return (IOException) cause;
+        return new IOException(e.getMessage(), e);
+    }
+
+    private String shortErr(Throwable e) {
+        if (e == null) return "unknown";
+        Throwable c = e.getCause();
+        String msg = c != null && c.getMessage() != null ? c.getMessage() : e.getMessage();
+        return TextUtils.isEmpty(msg) ? e.getClass().getSimpleName() : msg;
     }
 
     private void initElm() throws IOException, InterruptedException {

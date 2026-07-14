@@ -1,6 +1,18 @@
-# OBD Speed Demo
+# OBD Speed Demo v0.2
 
 一个用于验证廉价 ELM327 / OBDII 蓝牙模块的 Android Demo。
+
+## v0.2 连接修复
+
+本版修复部分廉价 OBDII / ELM327 蓝牙模块无法连接的问题：
+
+- 优先尝试 `createInsecureRfcommSocketToServiceRecord`。
+- 再尝试标准 Secure SPP。
+- 再尝试隐藏 API `createInsecureRfcommSocket(channel)` / `createRfcommSocket(channel)`。
+- 兜底扫描 RFCOMM channel 1-30。
+- 日志会显示每一种连接方式是否成功，便于继续排查。
+
+如果 Torque / ELM327 Identifier 能连，但本 Demo 不能连，请先完全退出其它 OBD 软件，因为同一时间通常只能有一个 APP 占用 OBD 蓝牙串口。
 
 ## 当前功能
 
